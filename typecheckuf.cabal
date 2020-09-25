@@ -26,5 +26,5 @@ executable typecheckuf
                      , mtl
   -- hs-source-dirs:
   default-language:    Haskell2010
-  default-extensions: RankNTypes Strict BlockArguments FlexibleContexts FlexibleInstances LambdaCase
+  default-extensions: RankNTypes Strict BlockArguments FlexibleContexts FlexibleInstances LambdaCase GeneralizedNewtypeDeriving
 
