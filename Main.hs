@@ -50,7 +50,7 @@ data Exp
 type Qname = String
 
 data TV = TV String Level
-  deriving (Show)
+  deriving (Show, Eq)
 
 data Typ
   = TVar TV
@@ -65,16 +65,28 @@ newtype TypecheckM a = TypecheckM
   }
   deriving (Functor, Applicative, Monad, MonadState (M.Map String Level, UF String), MonadIO)
 
-runTypecheckM :: TypecheckM a -> IO a
+runTypecheckM :: TypecheckM Typ -> IO Typ
 runTypecheckM x = do
-  (a, s) <- flip runStateT (M.empty, UF M.empty) . impl $ x
+  (a, s) <- flip runStateT (M.empty, UF M.empty) . impl $ (pathCompression =<< x)
   pure a
+    where 
+      -- 一通り終わった後にTVarをUnionFindの親に書き換える
+      pathCompression :: Typ -> TypecheckM Typ
+      pathCompression t@(TVar tv) = do
+        case tv of
+          TV _ _ -> do
+            tp' <- findTV tv
+            pure . TVar $ tp'
+      pathCompression (TArrow l r) = TArrow <$> pathCompression l <*> pathCompression r
+      pathCompression t = pure t
 
+-- private
 getUF :: TypecheckM (UF String)
 getUF = do
   uf <- snd <$> get
   pure uf
 
+-- private
 putUF :: UF String -> TypecheckM ()
 putUF x = do
   (m, uf) <- get
@@ -93,8 +105,7 @@ union l r = do
         (Just lp', Just rp') -> UF do M.insert lp' rp' map
    in putUF newmap
 
--- 本来ならモジュール内に隠蔽する関数
--- TODO: これ生で使ってるところfindTVに置き換える
+-- private
 find :: String -> TypecheckM String
 find k = do
   (UF map) <- getUF
@@ -114,16 +125,19 @@ findTV (TV s l) = do
   lp <- getLevel sp
   pure $ TV sp lp
 
+-- private
 getLevelMap :: TypecheckM (M.Map String Level)
 getLevelMap = do
   x <- fst <$> get
   pure x
 
+-- private
 putLevelMap :: M.Map String Level -> TypecheckM ()
 putLevelMap x = do
   (m, uf) <- get
   put (x, uf)
 
+-- private?
 getLevel :: String -> TypecheckM Level
 getLevel s = do
   m <- getLevelMap
@@ -138,8 +152,8 @@ updateLevelMap s l = do
 -- UnionFindでparentが同じ場合Unbound
 -- 備考:他の型がこのTVにLinkされていることはありうる
 isUnbound :: TV -> TypecheckM Bool
-isUnbound (TV s _) = do
-  (== s) <$> find s
+isUnbound tv = do
+  (== tv) <$> findTV tv
 
 getTVLevel :: TV -> Level
 getTVLevel (TV _ l) = l
@@ -263,21 +277,12 @@ typeof env (Let x e e2) = do
   e2t <- typeof (M.insert x et' env) e2
   typeof (M.insert x et' env) e2
 
--- 一通り終わった後にTVarをUnionFindの親に書き換える
-pathCompression :: Typ -> TypecheckM Typ
-pathCompression t@(TVar tv) = do
-  case tv of
-    TV _ _ -> do
-      tp' <- findTV tv
-      pure . TVar $ tp'
-pathCompression (TArrow l r) = TArrow <$> pathCompression l <*> pathCompression r
-pathCompression t = pure t
 
 main :: IO ()
 main = do
   let e0 =
         Lam "x" (Var "x")
-  print =<< (runTypecheckM $ pathCompression =<< typeof (M.empty) e0)
+  print =<< (runTypecheckM $ typeof (M.empty) e0)
 
   -- fun x -> let f = fun a -> a in f x
   let e1 =
@@ -288,7 +293,7 @@ main = do
               (Lam "a" (Var "a"))
               (App (Var "f") (Var "x"))
           )
-  print =<< (runTypecheckM $ pathCompression =<< typeof (M.empty) e1)
+  print =<< (runTypecheckM $ typeof (M.empty) e1)
 
   -- fun x -> let y = x in y
   let e2 =
@@ -299,4 +304,4 @@ main = do
               (Var "x")
               (Var "y")
           )
-  print =<< (runTypecheckM $ pathCompression =<< typeof (M.empty) e2)
+  print =<< (runTypecheckM $ typeof (M.empty) e2)
