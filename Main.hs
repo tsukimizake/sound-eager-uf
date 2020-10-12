@@ -14,28 +14,6 @@ type Varname = String
 
 type Level = Int
 
--- level, gensymは手抜きでグローバル変数
--- 真面目にやるならStateなりSTなり使って
-currentLevel :: IORef Int
-currentLevel = unsafePerformIO do newIORef 1
-
-enterLevel :: IO ()
-enterLevel = do
-  modifyIORef' currentLevel (+ 1)
-
-leaveLevel :: IO ()
-leaveLevel = do
-  modifyIORef' currentLevel (\x -> x - 1)
-
-genSymCount :: IORef Int
-genSymCount = unsafePerformIO do newIORef 0
-
-genSym :: IO String
-genSym = do
-  x <- readIORef genSymCount
-  modifyIORef' genSymCount (+ 1)
-  pure do show x
-
 -- Mapのkが子、vが親
 newtype UF key = UF (M.Map key key)
   deriving (Show)
@@ -60,37 +38,50 @@ data Typ
 
 type Env = M.Map Varname Typ
 
-newtype TypecheckM a = TypecheckM
-  { impl :: StateT (M.Map String Level, UF String) IO a
+data TypecheckState = TypecheckState
+  { levelMap_ :: M.Map String Level,
+    uf_ :: UF String,
+    genSymCount_ :: Int,
+    levelCount_ :: Int
   }
-  deriving (Functor, Applicative, Monad, MonadState (M.Map String Level, UF String), MonadIO)
 
-runTypecheckM :: TypecheckM Typ -> IO Typ
-runTypecheckM x = do
-  (a, s) <- flip runStateT (M.empty, UF M.empty) . impl $ (pathCompression =<< x)
-  pure a
-    where 
-      -- 一通り終わった後にTVarをUnionFindの親に書き換える
-      pathCompression :: Typ -> TypecheckM Typ
-      pathCompression t@(TVar tv) = do
-        case tv of
-          TV _ _ -> do
-            tp' <- findTV tv
-            pure . TVar $ tp'
-      pathCompression (TArrow l r) = TArrow <$> pathCompression l <*> pathCompression r
-      pathCompression t = pure t
+newtype TypecheckM a = TypecheckM
+  { impl :: State TypecheckState a
+  }
+  deriving (Functor, Applicative, Monad, MonadState TypecheckState)
+
+runTypecheckM :: TypecheckM Typ -> Typ
+runTypecheckM x =
+  let (a, s) = flip runState (TypecheckState (M.empty) (UF M.empty) 0 0) $ impl (pathCompression =<< x)
+   in a
+  where
+    -- 一通り終わった後にTVarをUnionFindの親に書き換える
+    pathCompression :: Typ -> TypecheckM Typ
+    pathCompression t@(TVar tv) = do
+      case tv of
+        TV _ _ -> do
+          tp' <- findTV tv
+          pure . TVar $ tp'
+    pathCompression (TArrow l r) = TArrow <$> pathCompression l <*> pathCompression r
+    pathCompression t = pure t
 
 -- private
 getUF :: TypecheckM (UF String)
 getUF = do
-  uf <- snd <$> get
+  uf <- uf_ <$> get
   pure uf
 
 -- private
 putUF :: UF String -> TypecheckM ()
 putUF x = do
-  (m, uf) <- get
-  put (m, x)
+  s <- get
+  put s {uf_ = x}
+
+genSym :: TypecheckM String
+genSym = do
+  s@(TypecheckState _ _ i _) <- get
+  put s {genSymCount_ = i + 1}
+  pure $ show i
 
 -- 本来なら型が確定している方を親にする処理がいりそう?(今は単純型付きラムダ計算的なやつなので不要)
 union :: String -> String -> TypecheckM ()
@@ -128,14 +119,14 @@ findTV (TV s l) = do
 -- private
 getLevelMap :: TypecheckM (M.Map String Level)
 getLevelMap = do
-  x <- fst <$> get
+  x <- levelMap_ <$> get
   pure x
 
 -- private
 putLevelMap :: M.Map String Level -> TypecheckM ()
 putLevelMap x = do
-  (m, uf) <- get
-  put (x, uf)
+  s <- get
+  put $ s {levelMap_ = x}
 
 -- private?
 getLevel :: String -> TypecheckM Level
@@ -147,6 +138,24 @@ updateLevelMap :: String -> Level -> TypecheckM ()
 updateLevelMap s l = do
   map <- getLevelMap
   putLevelMap $ M.insert s l map
+
+enterLevel :: TypecheckM ()
+enterLevel = do
+  s@(TypecheckState _ _ _ l) <- get
+  put $ s {levelCount_ = l + 1}
+  pure ()
+
+leaveLevel :: TypecheckM ()
+leaveLevel = do
+  s@(TypecheckState _ _ _ l) <- get
+  put $ s {levelCount_ = l -1}
+  pure ()
+
+currentLevel :: TypecheckM Int
+currentLevel = do 
+  s@(TypecheckState _ _ _ l) <- get
+  pure l
+
 
 -- typecheckrefで言うUnboundの場合にTrue
 -- UnionFindでparentが同じ場合Unbound
@@ -226,15 +235,15 @@ inst ty = fst <$> go M.empty ty
 
 newvar :: TypecheckM Typ
 newvar = do
-  s <- liftIO genSym
-  lvl <- liftIO $ readIORef currentLevel
+  s <- genSym
+  lvl <- currentLevel
   m <- getLevelMap
   putLevelMap $ M.insert s lvl m
   pure do TVar do { TV s lvl }
 
 gen :: Typ -> TypecheckM Typ
 gen (TVar tv) = do
-  current <- liftIO do readIORef currentLevel
+  current <- currentLevel
   tvisUnbound <- isUnbound tv
   if tvisUnbound
     then do
@@ -245,12 +254,6 @@ gen (TVar tv) = do
     else do
       tvp <- findTV tv
       gen do TVar tvp
-
---tv' <- readIORef tv
---current <- readIORef currentLevel
---case tv' of
---  Unbound s lvl -> if lvl > current then pure do QVar s else pure do TVar tv
---  Link t -> gen t
 gen (TArrow l r) = do
   l' <- gen l
   r' <- gen r
@@ -270,19 +273,18 @@ typeof env (App f x) = do
   unify ft (TArrow xt rt)
   pure rt
 typeof env (Let x e e2) = do
-  liftIO enterLevel
+  enterLevel
   et <- typeof env e
-  liftIO leaveLevel
+  leaveLevel
   et' <- gen et
   e2t <- typeof (M.insert x et' env) e2
   typeof (M.insert x et' env) e2
-
 
 main :: IO ()
 main = do
   let e0 =
         Lam "x" (Var "x")
-  print =<< (runTypecheckM $ typeof (M.empty) e0)
+  print $ runTypecheckM $ typeof (M.empty) e0
 
   -- fun x -> let f = fun a -> a in f x
   let e1 =
@@ -293,7 +295,7 @@ main = do
               (Lam "a" (Var "a"))
               (App (Var "f") (Var "x"))
           )
-  print =<< (runTypecheckM $ typeof (M.empty) e1)
+  print $ runTypecheckM $ typeof (M.empty) e1
 
   -- fun x -> let y = x in y
   let e2 =
@@ -304,4 +306,4 @@ main = do
               (Var "x")
               (Var "y")
           )
-  print =<< (runTypecheckM $ typeof (M.empty) e2)
+  print $ runTypecheckM $ typeof (M.empty) e2
