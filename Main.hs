@@ -1,14 +1,9 @@
 module Main where
 
 import Control.Monad
-import Control.Monad.ST
-import Control.Monad.ST.Unsafe
 import Control.Monad.State.Strict
-import Data.IORef
 import qualified Data.Map.Strict as M
 import Data.Maybe as Maybe
-import Data.STRef
-import System.IO.Unsafe
 
 type Varname = String
 
